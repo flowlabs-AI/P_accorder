@@ -1,4 +1,5 @@
-﻿using System.Drawing.Drawing2D;
+using System.Drawing.Drawing2D;
+using System.Globalization;
 using NAudio.Wave;
 
 namespace Accorder;
@@ -10,7 +11,15 @@ public sealed class TunerForm : Form
     private const float RmsGate = 0.008f;
     private const float InTuneCents = 5f;
 
-    private readonly ComboBox _deviceBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Top };
+    private static readonly string SettingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Accorder", "reference.txt");
+
+    private readonly TableLayoutPanel _topBar = new() { Dock = DockStyle.Top, Height = 32, ColumnCount = 4, RowCount = 1 };
+    private readonly ComboBox _deviceBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
+    private readonly NumericUpDown _referenceBox = new()
+    {
+        Minimum = 400, Maximum = 480, DecimalPlaces = 1, Increment = 1, Width = 70, Anchor = AnchorStyles.Left,
+    };
     private readonly System.Windows.Forms.Timer _animTimer = new() { Interval = 16 };
     private readonly PitchDetector _detector = new(SampleRate, AnalysisSize);
 
@@ -21,7 +30,8 @@ public sealed class TunerForm : Form
     private int _samplesSinceAnalysis;
     private readonly Queue<float> _recent = new();
 
-    // Ã‰tat affichÃ© (thread UI)
+    // État affiché (thread UI)
+    private float _reference = Note.DefaultReferenceA4;
     private Note? _note;
     private float _freq;
     private float _targetCents;
@@ -31,22 +41,38 @@ public sealed class TunerForm : Form
 
     public TunerForm()
     {
-        Text = "Accordeur â€” La 440 Hz";
         ClientSize = new Size(520, 440);
-        MinimumSize = new Size(380, 360);
+        MinimumSize = new Size(400, 380);
         BackColor = Color.FromArgb(24, 26, 30);
         ForeColor = Color.Gainsboro;
         DoubleBuffered = true;
         SetStyle(ControlStyles.ResizeRedraw, true);
 
-        _deviceBox.BackColor = Color.FromArgb(40, 43, 50);
+        // Barre du haut : [ micro .......... ] La [ 440.0 ] Hz
+        var fieldBack = Color.FromArgb(40, 43, 50);
+        _deviceBox.BackColor = fieldBack;
         _deviceBox.ForeColor = Color.Gainsboro;
         _deviceBox.FlatStyle = FlatStyle.Flat;
-        Controls.Add(_deviceBox);
+        _referenceBox.BackColor = fieldBack;
+        _referenceBox.ForeColor = Color.Gainsboro;
+
+        _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _topBar.Controls.Add(_deviceBox, 0, 0);
+        _topBar.Controls.Add(MakeLabel("La ="), 1, 0);
+        _topBar.Controls.Add(_referenceBox, 2, 0);
+        _topBar.Controls.Add(MakeLabel("Hz"), 3, 0);
+        Controls.Add(_topBar);
 
         for (int i = 0; i < WaveInEvent.DeviceCount; i++)
             _deviceBox.Items.Add(WaveInEvent.GetCapabilities(i).ProductName);
         _deviceBox.SelectedIndexChanged += (_, _) => StartCapture(_deviceBox.SelectedIndex);
+
+        _referenceBox.Value = (decimal)Math.Clamp(LoadReference(), 400f, 480f);
+        _referenceBox.ValueChanged += (_, _) => SetReference((float)_referenceBox.Value);
+        SetReference((float)_referenceBox.Value);
 
         _animTimer.Tick += (_, _) => Animate();
         _animTimer.Start();
@@ -54,10 +80,52 @@ public sealed class TunerForm : Form
         Load += (_, _) =>
         {
             if (_deviceBox.Items.Count > 0) _deviceBox.SelectedIndex = 0;
-            else MessageBox.Show(this, "Aucune entrÃ©e micro dÃ©tectÃ©e.", "Accordeur",
+            else MessageBox.Show(this, "Aucune entrée micro détectée.", "Accordeur",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         };
-        FormClosing += (_, _) => StopCapture();
+        FormClosing += (_, _) =>
+        {
+            StopCapture();
+            SaveReference(_reference);
+        };
+    }
+
+    private static Label MakeLabel(string text) => new()
+    {
+        Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(6, 0, 2, 0),
+    };
+
+    // ---------- Référence du La ----------
+
+    private void SetReference(float hz)
+    {
+        _reference = hz;
+        Text = $"Accordeur — La {hz.ToString("0.#", CultureInfo.CurrentCulture)} Hz";
+        _recent.Clear();
+        if (_note != null) _note = Note.FromFrequency(_freq, _reference);
+        Invalidate();
+    }
+
+    private static float LoadReference()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath) &&
+                float.TryParse(File.ReadAllText(SettingsPath), NumberStyles.Float, CultureInfo.InvariantCulture, out var hz))
+                return hz;
+        }
+        catch { /* réglage illisible : on garde la valeur par défaut */ }
+        return Note.DefaultReferenceA4;
+    }
+
+    private static void SaveReference(float hz)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+            File.WriteAllText(SettingsPath, hz.ToString(CultureInfo.InvariantCulture));
+        }
+        catch { /* pas bloquant */ }
     }
 
     // ---------- Audio ----------
@@ -94,7 +162,7 @@ public sealed class TunerForm : Form
         _waveIn = null;
     }
 
-    // AppelÃ© sur le thread audio
+    // Appelé sur le thread audio
     private void OnData(object? sender, WaveInEventArgs e)
     {
         for (int i = 0; i + 1 < e.BytesRecorded; i += 2)
@@ -104,7 +172,7 @@ public sealed class TunerForm : Form
             _samplesSinceAnalysis++;
         }
 
-        // Analyse environ tous les 2048 Ã©chantillons (~46 ms)
+        // Analyse environ tous les 2048 échantillons (~46 ms)
         if (_samplesSinceAnalysis < AnalysisSize / 2) return;
         _samplesSinceAnalysis = 0;
 
@@ -130,13 +198,13 @@ public sealed class TunerForm : Form
         _level = Math.Max(_level, Math.Clamp(rms * 8f, 0f, 1f));
         if (freq is not float f) return;
 
-        // MÃ©diane des derniÃ¨res mesures pour supprimer les sauts d'octave isolÃ©s
+        // Médiane des dernières mesures pour supprimer les sauts d'octave isolés
         _recent.Enqueue(f);
         while (_recent.Count > 5) _recent.Dequeue();
         float median = _recent.OrderBy(x => x).ElementAt(_recent.Count / 2);
 
         _freq = median;
-        _note = Note.FromFrequency(median);
+        _note = Note.FromFrequency(median, _reference);
         _targetCents = _note.Value.Cents;
         _lastDetection = DateTime.Now;
     }
@@ -163,7 +231,7 @@ public sealed class TunerForm : Form
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
-        int top = _deviceBox.Bottom;
+        int top = _topBar.Bottom;
         var area = new Rectangle(0, top, ClientSize.Width, ClientSize.Height - top);
         bool active = IsActive;
         bool inTune = active && Math.Abs(_needleCents) <= InTuneCents;
@@ -174,10 +242,10 @@ public sealed class TunerForm : Form
             : Math.Abs(_needleCents) < 20 ? Color.FromArgb(240, 190, 60)
             : Color.FromArgb(235, 85, 70);
 
-        // GÃ©omÃ©trie du cadran
+        // Géométrie du cadran
         float radius = Math.Min(area.Width * 0.40f, area.Height * 0.50f);
         var center = new PointF(area.Left + area.Width / 2f, area.Top + radius + 36);
-        const float sweep = 100f; // degrÃ©s couverts par Â±50 cents
+        const float sweep = 100f; // degrés couverts par ±50 cents
         static float Angle(float cents) => -90 + cents / 50f * (sweep / 2);
         PointF OnCircle(double deg, float r) =>
             new(center.X + (float)Math.Cos(deg * Math.PI / 180) * r, center.Y + (float)Math.Sin(deg * Math.PI / 180) * r);
@@ -207,11 +275,11 @@ public sealed class TunerForm : Form
             }
         }
 
-        // BÃ©mol / diÃ¨se
+        // Bémol / dièse
         using var sideFont = new Font("Segoe UI", 18, FontStyle.Bold);
         using var sideBrush = new SolidBrush(Color.FromArgb(120, 125, 135));
-        g.DrawString("â™­", sideFont, sideBrush, center.X - radius - 6, center.Y - 34);
-        g.DrawString("â™¯", sideFont, sideBrush, center.X + radius - 18, center.Y - 34);
+        g.DrawString("♭", sideFont, sideBrush, center.X - radius - 6, center.Y - 34);
+        g.DrawString("♯", sideFont, sideBrush, center.X + radius - 18, center.Y - 34);
 
         // Aiguille
         float shown = Math.Clamp(_needleCents, -50, 50);
@@ -228,7 +296,7 @@ public sealed class TunerForm : Form
         using var noteBrush = new SolidBrush(accent);
         using var infoBrush = new SolidBrush(Color.FromArgb(170, 175, 185));
 
-        string name = active ? _note!.Value.Name : "â€“";
+        string name = active ? _note!.Value.Name : "–";
         var nsz = g.MeasureString(name, noteFont);
         float nx = center.X - nsz.Width / 2;
         g.DrawString(name, noteFont, noteBrush, nx, textTop);
@@ -239,13 +307,13 @@ public sealed class TunerForm : Form
         if (active)
         {
             var n = _note!.Value;
-            info = $"{n.FrenchName}{n.Octave}   Â·   {_freq:0.0} Hz   Â·   {n.Cents:+0;-0;0} cents   Â·   cible {n.TargetFreq:0.00} Hz";
+            info = $"{n.FrenchName}{n.Octave}   ·   {_freq:0.0} Hz   ·   {n.Cents:+0;-0;0} cents   ·   cible {n.TargetFreq:0.00} Hz";
         }
-        else info = "Jouez une cordeâ€¦";
+        else info = "Jouez une corde…";
         var isz = g.MeasureString(info, infoFont);
         g.DrawString(info, infoFont, infoBrush, center.X - isz.Width / 2, textTop + nsz.Height - 4);
 
-        // Vu-mÃ¨tre d'entrÃ©e
+        // Vu-mètre d'entrée
         float barW = area.Width - 40, barY = ClientSize.Height - 14;
         using (var bg = new SolidBrush(Color.FromArgb(45, 48, 55)))
             g.FillRectangle(bg, 20, barY, barW, 5);
